@@ -9,6 +9,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS infrastructure (
     id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    cluster          TEXT        NOT NULL,
     kind             TEXT        NOT NULL,
     name             TEXT        NOT NULL,
     namespace        TEXT        NOT NULL DEFAULT '',
@@ -18,14 +19,18 @@ CREATE TABLE IF NOT EXISTS infrastructure (
     enriched         BOOLEAN     NOT NULL DEFAULT FALSE,
     embedding        vector(384),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (kind, name, namespace)
+    UNIQUE (cluster, kind, name, namespace)
 );
 
 CREATE INDEX IF NOT EXISTS infrastructure_embedding_idx
     ON infrastructure USING hnsw (embedding vector_cosine_ops);
 
+CREATE INDEX IF NOT EXISTS infrastructure_cluster_idx
+    ON infrastructure (cluster);
+
 CREATE TABLE IF NOT EXISTS incidents (
     id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    cluster    TEXT        NOT NULL,
     summary    TEXT        NOT NULL,
     content    TEXT        NOT NULL,
     severity   TEXT,
@@ -36,6 +41,9 @@ CREATE TABLE IF NOT EXISTS incidents (
 
 CREATE INDEX IF NOT EXISTS incidents_embedding_idx
     ON incidents USING hnsw (embedding vector_cosine_ops);
+
+CREATE INDEX IF NOT EXISTS incidents_cluster_idx
+    ON incidents (cluster);
 """
 
 
@@ -50,6 +58,7 @@ async def create_pool(dsn: str) -> asyncpg.Pool:
 async def upsert_resource(
     pool: asyncpg.Pool,
     *,
+    cluster: str,
     kind: str,
     name: str,
     namespace: str,
@@ -68,9 +77,9 @@ async def upsert_resource(
     row = await pool.fetchrow(
         """
         INSERT INTO infrastructure
-            (kind, name, namespace, content_hash, structural_hash, content, embedding, enriched)
-        VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8)
-        ON CONFLICT (kind, name, namespace) DO UPDATE
+            (cluster, kind, name, namespace, content_hash, structural_hash, content, embedding, enriched)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9)
+        ON CONFLICT (cluster, kind, name, namespace) DO UPDATE
             SET content_hash    = EXCLUDED.content_hash,
                 structural_hash = EXCLUDED.structural_hash,
                 content         = EXCLUDED.content,
@@ -79,10 +88,10 @@ async def upsert_resource(
                 updated_at      = now()
             WHERE infrastructure.content_hash != EXCLUDED.content_hash
         RETURNING
-            (xmax = 0)                                              AS inserted,
-            infrastructure.structural_hash != EXCLUDED.structural_hash AS structure_changed
+            (xmax = 0)                                                    AS inserted,
+            infrastructure.structural_hash != EXCLUDED.structural_hash    AS structure_changed
         """,
-        kind, name, namespace,
+        cluster, kind, name, namespace,
         content_hash, structural_hash, content, str(embedding), enriched,
     )
     if row is None:
@@ -93,11 +102,12 @@ async def upsert_resource(
 async def delete_resource(
     pool: asyncpg.Pool,
     *,
+    cluster: str,
     kind: str,
     name: str,
     namespace: str,
 ) -> None:
     await pool.execute(
-        "DELETE FROM infrastructure WHERE kind=$1 AND name=$2 AND namespace=$3",
-        kind, name, namespace,
+        "DELETE FROM infrastructure WHERE cluster=$1 AND kind=$2 AND name=$3 AND namespace=$4",
+        cluster, kind, name, namespace,
     )

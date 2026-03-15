@@ -15,6 +15,7 @@ async def _process_events(
     enrich_queue: asyncio.Queue,
     pool,
     embedder: EmbedderClient,
+    cluster: str,
     enrich_enabled: bool,
 ) -> None:
     """Main loop: consume k8s events, embed and store them."""
@@ -24,6 +25,7 @@ async def _process_events(
             if event.event_type == "DELETED":
                 await delete_resource(
                     pool,
+                    cluster=cluster,
                     kind=event.kind,
                     name=event.name,
                     namespace=event.namespace,
@@ -38,6 +40,7 @@ async def _process_events(
 
             content_changed, structure_changed = await upsert_resource(
                 pool,
+                cluster=cluster,
                 kind=event.kind,
                 name=event.name,
                 namespace=event.namespace,
@@ -94,7 +97,7 @@ async def main() -> None:
     async with asyncio.TaskGroup() as tg:
         tg.create_task(start_watchers(event_queue))
         tg.create_task(_process_events(
-            event_queue, enrich_queue, pool, embedder, conf.enrich_enabled,
+            event_queue, enrich_queue, pool, embedder, conf.cluster, conf.enrich_enabled,
         ))
         if anthropic_client:
             tg.create_task(enrichment_worker(

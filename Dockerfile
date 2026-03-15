@@ -16,6 +16,7 @@ RUN useradd -m -u 1000 watcher \
     && chown -R watcher:watcher /app
 USER watcher
 
+# CLUSTER_NAME is required — set it in the deployment manifest
 ENV LOG_LEVEL=INFO
 ENV ENRICH_ENABLED=true
 ENV ENRICH_CONCURRENCY=2
