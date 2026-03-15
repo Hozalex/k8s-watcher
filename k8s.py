@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from kubernetes import client, config, watch
+from kubernetes.client.exceptions import ApiException
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 STABLE_KINDS = {
     "Deployment", "StatefulSet", "DaemonSet",
     "Ingress", "HTTPRoute", "Gateway",
-    "CronJob", "RabbitmqCluster",
+    "CronJob",
 }
 
 # (api_version, plural, namespaced)
@@ -40,8 +41,6 @@ WATCHED_RESOURCES = [
     ("autoscaling/v2",                "horizontalpodautoscalers", True),
     # Infrastructure
     ("v1",                            "nodes",                   False),
-    # Middleware / data
-    ("rabbitmq.com/v1beta1",          "rabbitmqclusters",        True),
 ]
 
 # Top-level spec fields that are volatile (scaling) and should NOT
@@ -384,12 +383,24 @@ def _watch_resource(
                 )
                 asyncio.run_coroutine_threadsafe(queue.put(event), loop)
 
+        except ApiException as exc:
+            if exc.status == 404:
+                logger.warning(
+                    "Resource %s/%s not found in this cluster (CRD not installed) — skipping",
+                    api_version, plural,
+                )
+                return  # no point retrying
+            logger.exception("Watch error for %s/%s, restarting in 5s", api_version, plural)
+            time.sleep(5)
         except Exception:
             logger.exception("Watch error for %s/%s, restarting in 5s", api_version, plural)
             time.sleep(5)
 
 
-async def start_watchers(queue: asyncio.Queue) -> None:
+async def start_watchers(
+    queue: asyncio.Queue,
+    extra: list[tuple[str, str, bool]] | None = None,
+) -> None:
     try:
         config.load_incluster_config()
         logger.info("Using in-cluster kubeconfig")
@@ -399,17 +410,19 @@ async def start_watchers(queue: asyncio.Queue) -> None:
 
     from concurrent.futures import ThreadPoolExecutor
 
+    all_resources = WATCHED_RESOURCES + (extra or [])
+
     # Dedicated pool so watcher threads don't starve asyncio's default pool
     # (httpx uses it for getaddrinfo / DNS resolution).
     watcher_pool = ThreadPoolExecutor(
-        max_workers=len(WATCHED_RESOURCES),
+        max_workers=len(all_resources),
         thread_name_prefix="k8s-watch",
     )
     loop = asyncio.get_running_loop()
-    for api_version, plural, namespaced in WATCHED_RESOURCES:
+    for api_version, plural, namespaced in all_resources:
         loop.run_in_executor(
             watcher_pool,
             _watch_resource,
             api_version, plural, namespaced, queue, loop,
         )
-    logger.info("Watchers started for %d resource types", len(WATCHED_RESOURCES))
+    logger.info("Watchers started for %d resource types", len(all_resources))

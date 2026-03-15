@@ -107,7 +107,10 @@ async def main() -> None:
 
     tasks: list[asyncio.Task] = []
     try:
-        tasks.append(asyncio.create_task(start_watchers(event_queue), name="watchers"))
+        tasks.append(asyncio.create_task(
+            start_watchers(event_queue, extra=conf.extra_watched_resources),
+            name="watchers",
+        ))
         tasks.append(asyncio.create_task(
             _process_events(event_queue, enrich_queue, pool, embedder, conf.cluster, conf.enrich_enabled),
             name="process_events",

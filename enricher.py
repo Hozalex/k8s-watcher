@@ -46,6 +46,14 @@ async def _enrich_one(
         )
         enriched_text = msg.content[0].text.strip()
 
+        in_tok = msg.usage.input_tokens
+        out_tok = msg.usage.output_tokens
+        cost_usd = in_tok * 0.80 / 1_000_000 + out_tok * 4.00 / 1_000_000
+        logger.info(
+            "Haiku enriched %s/%s/%s — in=%d out=%d tokens, cost=$%.5f",
+            task.kind, task.namespace, task.name, in_tok, out_tok, cost_usd,
+        )
+
         # Embed the enriched description
         embedding = await embedder.embed(enriched_text)
 
@@ -62,7 +70,6 @@ async def _enrich_one(
             enriched_text, str(embedding),
             task.kind, task.name, task.namespace,
         )
-        logger.info("Enriched %s/%s/%s", task.kind, task.namespace, task.name)
 
     except Exception:
         logger.exception("Failed to enrich %s/%s/%s", task.kind, task.namespace, task.name)
