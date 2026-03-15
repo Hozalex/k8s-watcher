@@ -1,0 +1,404 @@
+"""
+Kubernetes resource watcher.
+
+Generates template-based text for every resource change.
+LLM enrichment is gated on structural_hash — changes to replicas or
+HPA current counts do NOT trigger a Haiku call.
+"""
+import asyncio
+import copy
+import hashlib
+import json
+import logging
+from dataclasses import dataclass
+from typing import Any
+
+from kubernetes import client, config, watch
+
+logger = logging.getLogger(__name__)
+
+# Kinds that carry business meaning and benefit from LLM enrichment
+STABLE_KINDS = {
+    "Deployment", "StatefulSet", "DaemonSet",
+    "Ingress", "HTTPRoute", "Gateway",
+    "CronJob", "RabbitmqCluster",
+}
+
+# (api_version, plural, namespaced)
+WATCHED_RESOURCES = [
+    # Core workloads
+    ("apps/v1",                       "deployments",             True),
+    ("apps/v1",                       "statefulsets",            True),
+    ("apps/v1",                       "daemonsets",              True),
+    # Networking
+    ("v1",                            "services",                True),
+    ("networking.k8s.io/v1",          "ingresses",               True),
+    ("gateway.networking.k8s.io/v1",  "gateways",                True),
+    ("gateway.networking.k8s.io/v1",  "httproutes",              True),
+    # Scheduling & scaling
+    ("batch/v1",                      "cronjobs",                True),
+    ("autoscaling/v2",                "horizontalpodautoscalers", True),
+    # Infrastructure
+    ("v1",                            "nodes",                   False),
+    # Middleware / data
+    ("rabbitmq.com/v1beta1",          "rabbitmqclusters",        True),
+]
+
+# Top-level spec fields that are volatile (scaling) and should NOT
+# trigger LLM re-enrichment when they change.
+_VOLATILE_SPEC_FIELDS: dict[str, set[str]] = {
+    "Deployment":              {"replicas"},
+    "StatefulSet":             {"replicas"},
+    "HorizontalPodAutoscaler": {"currentReplicas", "desiredReplicas"},
+}
+
+
+@dataclass
+class ResourceEvent:
+    event_type: str       # ADDED | MODIFIED | DELETED
+    kind: str
+    name: str
+    namespace: str
+    content: str          # template text
+    content_hash: str     # full spec hash — controls re-embedding
+    structural_hash: str  # spec minus volatile fields — controls LLM enrichment
+    needs_enrichment: bool
+
+
+# ── Template generators ────────────────────────────────────────────────────────
+
+def _labels(obj: dict) -> str:
+    labels = obj.get("metadata", {}).get("labels") or {}
+    return ", ".join(f"{k}={v}" for k, v in labels.items()) or "none"
+
+
+def _render_deployment(obj: dict) -> str:
+    meta = obj["metadata"]
+    spec = obj.get("spec", {})
+    status = obj.get("status", {})
+    containers = spec.get("template", {}).get("spec", {}).get("containers", [])
+    images = ", ".join(c.get("image", "?") for c in containers)
+    selector = json.dumps(spec.get("selector", {}).get("matchLabels", {}))
+    conditions = ", ".join(
+        f"{c['type']}={c['status']}" for c in status.get("conditions", [])
+    )
+    return (
+        f"Deployment {meta['name']} / {meta.get('namespace', '')}\n"
+        f"Replicas: {status.get('readyReplicas', 0)}/{spec.get('replicas', '?')} ready\n"
+        f"Images: {images}\n"
+        f"Selector: {selector}\n"
+        f"Labels: {_labels(obj)}\n"
+        f"Conditions: {conditions or 'none'}"
+    )
+
+
+def _render_statefulset(obj: dict) -> str:
+    meta = obj["metadata"]
+    spec = obj.get("spec", {})
+    status = obj.get("status", {})
+    containers = spec.get("template", {}).get("spec", {}).get("containers", [])
+    images = ", ".join(c.get("image", "?") for c in containers)
+    return (
+        f"StatefulSet {meta['name']} / {meta.get('namespace', '')}\n"
+        f"Replicas: {status.get('readyReplicas', 0)}/{spec.get('replicas', '?')} ready\n"
+        f"Images: {images}\n"
+        f"ServiceName: {spec.get('serviceName', '?')}\n"
+        f"Labels: {_labels(obj)}"
+    )
+
+
+def _render_daemonset(obj: dict) -> str:
+    meta = obj["metadata"]
+    spec = obj.get("spec", {})
+    status = obj.get("status", {})
+    containers = spec.get("template", {}).get("spec", {}).get("containers", [])
+    images = ", ".join(c.get("image", "?") for c in containers)
+    return (
+        f"DaemonSet {meta['name']} / {meta.get('namespace', '')}\n"
+        f"Desired: {status.get('desiredNumberScheduled', '?')}, "
+        f"Ready: {status.get('numberReady', '?')}\n"
+        f"Images: {images}\n"
+        f"Labels: {_labels(obj)}"
+    )
+
+
+def _render_service(obj: dict) -> str:
+    meta = obj["metadata"]
+    spec = obj.get("spec", {})
+    ports = ", ".join(
+        f"{p.get('port')}->{p.get('targetPort', '?')}/{p.get('protocol', 'TCP')}"
+        for p in spec.get("ports", [])
+    )
+    return (
+        f"Service {meta['name']} / {meta.get('namespace', '')}\n"
+        f"Type: {spec.get('type', 'ClusterIP')}\n"
+        f"Ports: {ports or 'none'}\n"
+        f"Selector: {json.dumps(spec.get('selector') or {})}\n"
+        f"ClusterIP: {spec.get('clusterIP', '?')}\n"
+        f"Labels: {_labels(obj)}"
+    )
+
+
+def _render_ingress(obj: dict) -> str:
+    meta = obj["metadata"]
+    spec = obj.get("spec", {})
+    rules = spec.get("rules", [])
+    hosts = ", ".join(r.get("host", "*") for r in rules) or "any"
+    paths = ", ".join(
+        f"{r.get('host', '*')}{p['path']}"
+        for r in rules
+        for p in r.get("http", {}).get("paths", [])
+    )
+    tls_hosts = ", ".join(
+        h for t in spec.get("tls", []) for h in t.get("hosts", [])
+    ) or "none"
+    return (
+        f"Ingress {meta['name']} / {meta.get('namespace', '')}\n"
+        f"IngressClass: {spec.get('ingressClassName', '?')}\n"
+        f"Hosts: {hosts}\n"
+        f"Paths: {paths or 'none'}\n"
+        f"TLS: {tls_hosts}\n"
+        f"Labels: {_labels(obj)}"
+    )
+
+
+def _render_httproute(obj: dict) -> str:
+    meta = obj["metadata"]
+    spec = obj.get("spec", {})
+    hostnames = ", ".join(spec.get("hostnames", [])) or "any"
+    parents = ", ".join(
+        p.get("name", "?") for p in spec.get("parentRefs", [])
+    )
+    rules_count = len(spec.get("rules", []))
+    return (
+        f"HTTPRoute {meta['name']} / {meta.get('namespace', '')}\n"
+        f"Hostnames: {hostnames}\n"
+        f"Gateway: {parents}\n"
+        f"Rules: {rules_count}\n"
+        f"Labels: {_labels(obj)}"
+    )
+
+
+def _render_gateway(obj: dict) -> str:
+    meta = obj["metadata"]
+    spec = obj.get("spec", {})
+    listeners = ", ".join(
+        f"{l.get('name')}:{l.get('port')}/{l.get('protocol', '?')}"
+        for l in spec.get("listeners", [])
+    )
+    return (
+        f"Gateway {meta['name']} / {meta.get('namespace', '')}\n"
+        f"GatewayClass: {spec.get('gatewayClassName', '?')}\n"
+        f"Listeners: {listeners or 'none'}\n"
+        f"Labels: {_labels(obj)}"
+    )
+
+
+def _render_cronjob(obj: dict) -> str:
+    meta = obj["metadata"]
+    spec = obj.get("spec", {})
+    containers = (
+        spec.get("jobTemplate", {})
+            .get("spec", {})
+            .get("template", {})
+            .get("spec", {})
+            .get("containers", [])
+    )
+    images = ", ".join(c.get("image", "?") for c in containers)
+    return (
+        f"CronJob {meta['name']} / {meta.get('namespace', '')}\n"
+        f"Schedule: {spec.get('schedule', '?')}\n"
+        f"Images: {images}\n"
+        f"Suspend: {spec.get('suspend', False)}\n"
+        f"Labels: {_labels(obj)}"
+    )
+
+
+def _render_hpa(obj: dict) -> str:
+    meta = obj["metadata"]
+    spec = obj.get("spec", {})
+    status = obj.get("status", {})
+    ref = spec.get("scaleTargetRef", {})
+    return (
+        f"HorizontalPodAutoscaler {meta['name']} / {meta.get('namespace', '')}\n"
+        f"Target: {ref.get('kind', '?')}/{ref.get('name', '?')}\n"
+        f"Replicas: {status.get('currentReplicas', '?')} current, "
+        f"min={spec.get('minReplicas', '?')} max={spec.get('maxReplicas', '?')}\n"
+        f"Labels: {_labels(obj)}"
+    )
+
+
+def _render_node(obj: dict) -> str:
+    meta = obj["metadata"]
+    status = obj.get("status", {})
+    alloc = status.get("allocatable", {})
+    conditions = ", ".join(
+        f"{c['type']}={c['status']}" for c in status.get("conditions", [])
+    )
+    roles = ", ".join(
+        k.replace("node-role.kubernetes.io/", "")
+        for k in (meta.get("labels") or {})
+        if k.startswith("node-role.kubernetes.io/")
+    ) or "worker"
+    taints = ", ".join(
+        f"{t['key']}:{t['effect']}"
+        for t in obj.get("spec", {}).get("taints", [])
+    ) or "none"
+    return (
+        f"Node {meta['name']}\n"
+        f"Roles: {roles}\n"
+        f"CPU: {alloc.get('cpu', '?')}, Memory: {alloc.get('memory', '?')}\n"
+        f"Conditions: {conditions or 'none'}\n"
+        f"Taints: {taints}"
+    )
+
+
+def _render_rabbitmq(obj: dict) -> str:
+    meta = obj["metadata"]
+    spec = obj.get("spec", {})
+    status = obj.get("status", {})
+    conditions = ", ".join(
+        f"{c.get('type')}={c.get('status')}" for c in status.get("conditions", [])
+    )
+    return (
+        f"RabbitmqCluster {meta['name']} / {meta.get('namespace', '')}\n"
+        f"Replicas: {spec.get('replicas', '?')}\n"
+        f"Image: {spec.get('image', 'default')}\n"
+        f"Conditions: {conditions or 'none'}\n"
+        f"Labels: {_labels(obj)}"
+    )
+
+
+_RENDERERS = {
+    "Deployment":              _render_deployment,
+    "StatefulSet":             _render_statefulset,
+    "DaemonSet":               _render_daemonset,
+    "Service":                 _render_service,
+    "Ingress":                 _render_ingress,
+    "HTTPRoute":               _render_httproute,
+    "Gateway":                 _render_gateway,
+    "CronJob":                 _render_cronjob,
+    "HorizontalPodAutoscaler": _render_hpa,
+    "Node":                    _render_node,
+    "RabbitmqCluster":         _render_rabbitmq,
+}
+
+
+def _render(kind: str, obj: dict) -> str:
+    renderer = _RENDERERS.get(kind)
+    return renderer(obj) if renderer else json.dumps(obj.get("spec", {}), indent=2)
+
+
+def _hash(data: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(data, sort_keys=True).encode()
+    ).hexdigest()[:16]
+
+
+def _structural_hash(kind: str, spec: dict) -> str:
+    """Hash that ignores volatile fields (replica counts).
+    A change here means the resource actually changed shape → re-enrich."""
+    volatile = _VOLATILE_SPEC_FIELDS.get(kind)
+    if not volatile:
+        return _hash(spec)
+    stripped = {k: v for k, v in spec.items() if k not in volatile}
+    return _hash(stripped)
+
+
+# ── Watch loop ─────────────────────────────────────────────────────────────────
+
+def _watch_resource(
+    api_version: str,
+    plural: str,
+    namespaced: bool,
+    queue: asyncio.Queue,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Runs in a thread. Watches a single resource type and puts events in queue."""
+    import time
+
+    core_api = client.CoreV1Api()
+    custom_api = client.CustomObjectsApi()
+    w = watch.Watch()
+
+    group, _, version = api_version.partition("/")
+    if not version:
+        group, version = "", api_version
+
+    is_core = group == ""
+
+    logger.info("Starting watch: %s/%s", api_version, plural)
+
+    while True:
+        try:
+            kwargs: dict[str, Any] = {"timeout_seconds": 0}
+
+            if is_core:
+                list_fn = (
+                    getattr(core_api, f"list_namespaced_{plural[:-1]}")
+                    if namespaced
+                    else getattr(core_api, f"list_{plural[:-1]}")
+                )
+                stream = w.stream(list_fn, **kwargs)
+            else:
+                if namespaced:
+                    stream = w.stream(
+                        custom_api.list_namespaced_custom_object,
+                        group=group, version=version, plural=plural, namespace="",
+                        **kwargs,
+                    )
+                else:
+                    stream = w.stream(
+                        custom_api.list_cluster_custom_object,
+                        group=group, version=version, plural=plural,
+                        **kwargs,
+                    )
+
+            for raw in stream:
+                event_type = raw["type"]
+                obj = raw["object"]
+                kind = obj.get("kind") or plural.rstrip("s").capitalize()
+                meta = obj.get("metadata", {})
+                name = meta.get("name", "")
+                namespace = meta.get("namespace", "")
+                spec = obj.get("spec", {})
+
+                content = _render(kind, obj)
+                c_hash = _hash(spec)
+                s_hash = _structural_hash(kind, spec)
+
+                event = ResourceEvent(
+                    event_type=event_type,
+                    kind=kind,
+                    name=name,
+                    namespace=namespace,
+                    content=content,
+                    content_hash=c_hash,
+                    structural_hash=s_hash,
+                    needs_enrichment=(
+                        kind in STABLE_KINDS and event_type in ("ADDED", "MODIFIED")
+                    ),
+                )
+                asyncio.run_coroutine_threadsafe(queue.put(event), loop)
+
+        except Exception:
+            logger.exception("Watch error for %s/%s, restarting in 5s", api_version, plural)
+            time.sleep(5)
+
+
+async def start_watchers(queue: asyncio.Queue) -> None:
+    try:
+        config.load_incluster_config()
+        logger.info("Using in-cluster kubeconfig")
+    except config.ConfigException:
+        config.load_kube_config()
+        logger.info("Using local kubeconfig")
+
+    loop = asyncio.get_running_loop()
+    for api_version, plural, namespaced in WATCHED_RESOURCES:
+        loop.run_in_executor(
+            None,
+            _watch_resource,
+            api_version, plural, namespaced, queue, loop,
+        )
+    logger.info("Watchers started for %d resource types", len(WATCHED_RESOURCES))
