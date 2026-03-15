@@ -397,10 +397,18 @@ async def start_watchers(queue: asyncio.Queue) -> None:
         config.load_kube_config()
         logger.info("Using local kubeconfig")
 
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Dedicated pool so watcher threads don't starve asyncio's default pool
+    # (httpx uses it for getaddrinfo / DNS resolution).
+    watcher_pool = ThreadPoolExecutor(
+        max_workers=len(WATCHED_RESOURCES),
+        thread_name_prefix="k8s-watch",
+    )
     loop = asyncio.get_running_loop()
     for api_version, plural, namespaced in WATCHED_RESOURCES:
         loop.run_in_executor(
-            None,
+            watcher_pool,
             _watch_resource,
             api_version, plural, namespaced, queue, loop,
         )
