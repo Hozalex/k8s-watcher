@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import signal
 
 import anthropic
 
@@ -94,20 +95,41 @@ async def main() -> None:
         else None
     )
 
-    async with asyncio.TaskGroup() as tg:
-        tg.create_task(start_watchers(event_queue))
-        tg.create_task(_process_events(
-            event_queue, enrich_queue, pool, embedder, conf.cluster, conf.enrich_enabled,
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _handle_signal(sig: int) -> None:
+        logger.info("Received signal %s, shutting down gracefully…", signal.Signals(sig).name)
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _handle_signal, sig)
+
+    tasks: list[asyncio.Task] = []
+    try:
+        tasks.append(asyncio.create_task(start_watchers(event_queue), name="watchers"))
+        tasks.append(asyncio.create_task(
+            _process_events(event_queue, enrich_queue, pool, embedder, conf.cluster, conf.enrich_enabled),
+            name="process_events",
         ))
         if anthropic_client:
-            tg.create_task(enrichment_worker(
-                enrich_queue, anthropic_client, embedder, pool, conf.enrich_concurrency,
+            tasks.append(asyncio.create_task(
+                enrichment_worker(enrich_queue, anthropic_client, embedder, pool, conf.enrich_concurrency),
+                name="enrichment_worker",
             ))
         else:
             logger.warning("ANTHROPIC_API_KEY not set — LLM enrichment disabled")
 
-    await embedder.close()
-    await pool.close()
+        await stop_event.wait()
+
+    finally:
+        logger.info("Cancelling tasks…")
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await embedder.close()
+        await pool.close()
+        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":

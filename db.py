@@ -92,26 +92,36 @@ async def upsert_resource(
     """
     row = await pool.fetchrow(
         """
-        INSERT INTO infrastructure
-            (cluster, kind, name, namespace, content_hash, structural_hash, content, embedding, enriched)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9)
-        ON CONFLICT (cluster, kind, name, namespace) DO UPDATE
-            SET content_hash    = EXCLUDED.content_hash,
-                structural_hash = EXCLUDED.structural_hash,
-                content         = EXCLUDED.content,
-                embedding       = EXCLUDED.embedding,
-                enriched        = EXCLUDED.enriched,
-                updated_at      = now()
-            WHERE infrastructure.content_hash != EXCLUDED.content_hash
-        RETURNING
-            (xmax = 0)                                                    AS inserted,
-            infrastructure.structural_hash != EXCLUDED.structural_hash    AS structure_changed
+        WITH prev AS (
+            SELECT structural_hash AS old_hash
+            FROM infrastructure
+            WHERE cluster = $1 AND kind = $2 AND name = $3 AND namespace = $4
+        ),
+        upserted AS (
+            INSERT INTO infrastructure
+                (cluster, kind, name, namespace, content_hash, structural_hash, content, embedding, enriched)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector, $9)
+            ON CONFLICT (cluster, kind, name, namespace) DO UPDATE
+                SET content_hash    = EXCLUDED.content_hash,
+                    structural_hash = EXCLUDED.structural_hash,
+                    content         = EXCLUDED.content,
+                    embedding       = EXCLUDED.embedding,
+                    enriched        = EXCLUDED.enriched,
+                    updated_at      = now()
+                WHERE infrastructure.content_hash != EXCLUDED.content_hash
+            RETURNING xmax
+        )
+        SELECT
+            (upserted.xmax = 0)                AS inserted,
+            (prev.old_hash IS DISTINCT FROM $6) AS structure_changed
+        FROM upserted
+        LEFT JOIN prev ON true
         """,
         cluster, kind, name, namespace,
         content_hash, structural_hash, content, str(embedding), enriched,
     )
     if row is None:
-        return False, False   # nothing changed
+        return False, False   # content_hash unchanged — nothing to do
     return True, bool(row["inserted"] or row["structure_changed"])
 
 
