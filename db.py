@@ -6,7 +6,7 @@ import asyncpg
 logger = logging.getLogger(__name__)
 
 _SCHEMA = """
-CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pgvector;
 
 CREATE TABLE IF NOT EXISTS infrastructure (
     id               UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
