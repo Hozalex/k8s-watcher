@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 import asyncpg
@@ -47,12 +48,27 @@ CREATE INDEX IF NOT EXISTS incidents_cluster_idx
 """
 
 
-async def create_pool(dsn: str) -> asyncpg.Pool:
-    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5)
-    async with pool.acquire() as conn:
-        await conn.execute(_SCHEMA)
-    logger.info("Database schema ready")
-    return pool
+async def create_pool(dsn: str, retries: int = 10, delay: float = 5.0) -> asyncpg.Pool:
+    """Create a connection pool, retrying on failure.
+
+    Retries handle the window where Cilium FQDN policy hasn't yet resolved
+    the hostname and established egress rules.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5)
+            async with pool.acquire() as conn:
+                await conn.execute(_SCHEMA)
+            logger.info("Database schema ready")
+            return pool
+        except Exception as exc:
+            if attempt == retries:
+                raise
+            logger.warning(
+                "DB connect failed (attempt %d/%d): %s — retrying in %.0fs",
+                attempt, retries, exc, delay,
+            )
+            await asyncio.sleep(delay)
 
 
 async def upsert_resource(
