@@ -334,11 +334,10 @@ def _watch_resource(
             kwargs: dict[str, Any] = {"timeout_seconds": 0}
 
             if is_core:
-                list_fn = (
-                    getattr(core_api, f"list_namespaced_{plural[:-1]}")
-                    if namespaced
-                    else getattr(core_api, f"list_{plural[:-1]}")
-                )
+                if namespaced:
+                    list_fn = getattr(core_api, f"list_{plural[:-1]}_for_all_namespaces")
+                else:
+                    list_fn = getattr(core_api, f"list_{plural[:-1]}")
                 stream = w.stream(list_fn, **kwargs)
             else:
                 if namespaced:
