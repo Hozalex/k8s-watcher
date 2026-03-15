@@ -317,8 +317,9 @@ def _watch_resource(
     """Runs in a thread. Watches a single resource type and puts events in queue."""
     import time
 
-    core_api = client.CoreV1Api()
-    custom_api = client.CustomObjectsApi()
+    api_client_inst = client.ApiClient()
+    core_api = client.CoreV1Api(api_client=api_client_inst)
+    custom_api = client.CustomObjectsApi(api_client=api_client_inst)
     w = watch.Watch()
 
     group, _, version = api_version.partition("/")
@@ -356,6 +357,9 @@ def _watch_resource(
             for raw in stream:
                 event_type = raw["type"]
                 obj = raw["object"]
+                # Core API returns typed objects; serialize to plain dict
+                if not isinstance(obj, dict):
+                    obj = api_client_inst.sanitize_for_serialization(obj)
                 kind = obj.get("kind") or plural.rstrip("s").capitalize()
                 meta = obj.get("metadata", {})
                 name = meta.get("name", "")
