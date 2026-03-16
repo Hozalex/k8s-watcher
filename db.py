@@ -71,6 +71,23 @@ async def create_pool(dsn: str, retries: int = 10, delay: float = 5.0) -> asyncp
             await asyncio.sleep(delay)
 
 
+async def is_content_changed(
+    pool: asyncpg.Pool,
+    *,
+    cluster: str,
+    kind: str,
+    name: str,
+    namespace: str,
+    content_hash: str,
+) -> bool:
+    """Return True if the resource is new or its content_hash differs from the stored one."""
+    row = await pool.fetchrow(
+        "SELECT content_hash FROM infrastructure WHERE cluster=$1 AND kind=$2 AND name=$3 AND namespace=$4",
+        cluster, kind, name, namespace,
+    )
+    return row is None or row["content_hash"] != content_hash
+
+
 async def upsert_resource(
     pool: asyncpg.Pool,
     *,

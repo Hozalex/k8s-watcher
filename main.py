@@ -5,7 +5,7 @@ import signal
 import anthropic
 
 import config as cfg
-from db import create_pool, upsert_resource, delete_resource
+from db import create_pool, is_content_changed, upsert_resource, delete_resource
 from embedder import EmbedderClient
 from enricher import EnrichTask, enrichment_worker
 from k8s import ResourceEvent, start_watchers
@@ -36,7 +36,17 @@ async def _process_events(
                 )
                 continue
 
-            # Embed raw template text first (fast, no LLM)
+            # Skip embedding if content hasn't changed (avoids redundant calls on startup)
+            if not await is_content_changed(
+                pool,
+                cluster=cluster,
+                kind=event.kind,
+                name=event.name,
+                namespace=event.namespace,
+                content_hash=event.content_hash,
+            ):
+                continue
+
             embedding = await embedder.embed(event.content)
 
             content_changed, structure_changed = await upsert_resource(
