@@ -10,6 +10,7 @@ import copy
 import hashlib
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -317,8 +318,6 @@ def _watch_resource(
     loop: asyncio.AbstractEventLoop,
 ) -> None:
     """Runs in a thread. Watches a single resource type and puts events in queue."""
-    import time
-
     api_client_inst = client.ApiClient()
     core_api = client.CoreV1Api(api_client=api_client_inst)
     custom_api = client.CustomObjectsApi(api_client=api_client_inst)

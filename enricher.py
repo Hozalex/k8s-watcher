@@ -25,6 +25,7 @@ Plain text only, no markdown.
 
 @dataclass
 class EnrichTask:
+    cluster: str
     kind: str
     name: str
     namespace: str
@@ -65,10 +66,10 @@ async def _enrich_one(
                    embedding = $2::vector,
                    enriched  = TRUE,
                    updated_at = now()
-             WHERE kind=$3 AND name=$4 AND namespace=$5
+             WHERE cluster=$3 AND kind=$4 AND name=$5 AND namespace=$6
             """,
             enriched_text, str(embedding),
-            task.kind, task.name, task.namespace,
+            task.cluster, task.kind, task.name, task.namespace,
         )
 
     except Exception:

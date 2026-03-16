@@ -5,7 +5,7 @@ import signal
 import anthropic
 
 import config as cfg
-from db import create_pool, is_content_changed, upsert_resource, delete_resource
+from db import create_pool, fetch_hashes, upsert_resource, delete_resource
 from embedder import EmbedderClient
 from enricher import EnrichTask, enrichment_worker
 from k8s import ResourceEvent, start_watchers
@@ -36,16 +36,18 @@ async def _process_events(
                 )
                 continue
 
-            # Skip embedding if content hasn't changed (avoids redundant calls on startup)
-            if not await is_content_changed(
+            # Fetch existing hashes to avoid redundant embedding and enrichment calls.
+            # A single SELECT here replaces the previous two-query pattern
+            # (separate is_content_changed + structural_hash lookup inside upsert).
+            existing = await fetch_hashes(
                 pool,
                 cluster=cluster,
                 kind=event.kind,
                 name=event.name,
                 namespace=event.namespace,
-                content_hash=event.content_hash,
-            ):
-                continue
+            )
+            if existing is not None and existing[0] == event.content_hash:
+                continue  # content unchanged — skip embedding and upsert
 
             embedding = await embedder.embed(event.content)
 
@@ -60,6 +62,7 @@ async def _process_events(
                 content=event.content,
                 embedding=embedding,
                 enriched=False,
+                old_structural_hash=existing[1] if existing else None,
             )
 
             if content_changed:
@@ -69,6 +72,7 @@ async def _process_events(
                 # LLM enrichment only when structure changed (not just replica scaling)
                 if enrich_enabled and event.needs_enrichment and structure_changed:
                     await enrich_queue.put(EnrichTask(
+                        cluster=cluster,
                         kind=event.kind,
                         name=event.name,
                         namespace=event.namespace,
