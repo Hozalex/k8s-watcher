@@ -71,23 +71,36 @@ def _labels(obj: dict) -> str:
     return ", ".join(f"{k}={v}" for k, v in labels.items()) or "none"
 
 
+def _header(kind_label: str, meta: dict) -> str:
+    """Return the standard first line: '<Kind> <name> / <namespace>'."""
+    return f"{kind_label} {meta.get('name', '?')} / {meta.get('namespace', '')}\n"
+
+
+def _workload_images(spec: dict) -> str:
+    """Return a comma-separated list of container images for pod-template workloads."""
+    containers = spec.get("template", {}).get("spec", {}).get("containers", [])
+    return ", ".join(c.get("image", "?") for c in containers)
+
+
+def _format_conditions(conditions: list) -> str:
+    """Format a list of condition dicts as 'Type=Status, ...' or 'none'."""
+    return ", ".join(
+        f"{c.get('type')}={c.get('status')}" for c in conditions
+    ) or "none"
+
+
 def _render_deployment(obj: dict) -> str:
     meta = obj["metadata"]
     spec = obj.get("spec", {})
     status = obj.get("status", {})
-    containers = spec.get("template", {}).get("spec", {}).get("containers", [])
-    images = ", ".join(c.get("image", "?") for c in containers)
     selector = json.dumps(spec.get("selector", {}).get("matchLabels", {}))
-    conditions = ", ".join(
-        f"{c['type']}={c['status']}" for c in status.get("conditions", [])
-    )
     return (
-        f"Deployment {meta['name']} / {meta.get('namespace', '')}\n"
-        f"Replicas: {status.get('readyReplicas', 0)}/{spec.get('replicas', '?')} ready\n"
-        f"Images: {images}\n"
+        _header("Deployment", meta)
+        + f"Replicas: {status.get('readyReplicas', 0)}/{spec.get('replicas', '?')} ready\n"
+        f"Images: {_workload_images(spec)}\n"
         f"Selector: {selector}\n"
         f"Labels: {_labels(obj)}\n"
-        f"Conditions: {conditions or 'none'}"
+        f"Conditions: {_format_conditions(status.get('conditions', []))}"
     )
 
 
@@ -95,12 +108,10 @@ def _render_statefulset(obj: dict) -> str:
     meta = obj["metadata"]
     spec = obj.get("spec", {})
     status = obj.get("status", {})
-    containers = spec.get("template", {}).get("spec", {}).get("containers", [])
-    images = ", ".join(c.get("image", "?") for c in containers)
     return (
-        f"StatefulSet {meta['name']} / {meta.get('namespace', '')}\n"
-        f"Replicas: {status.get('readyReplicas', 0)}/{spec.get('replicas', '?')} ready\n"
-        f"Images: {images}\n"
+        _header("StatefulSet", meta)
+        + f"Replicas: {status.get('readyReplicas', 0)}/{spec.get('replicas', '?')} ready\n"
+        f"Images: {_workload_images(spec)}\n"
         f"ServiceName: {spec.get('serviceName', '?')}\n"
         f"Labels: {_labels(obj)}"
     )
@@ -110,13 +121,11 @@ def _render_daemonset(obj: dict) -> str:
     meta = obj["metadata"]
     spec = obj.get("spec", {})
     status = obj.get("status", {})
-    containers = spec.get("template", {}).get("spec", {}).get("containers", [])
-    images = ", ".join(c.get("image", "?") for c in containers)
     return (
-        f"DaemonSet {meta['name']} / {meta.get('namespace', '')}\n"
-        f"Desired: {status.get('desiredNumberScheduled', '?')}, "
+        _header("DaemonSet", meta)
+        + f"Desired: {status.get('desiredNumberScheduled', '?')}, "
         f"Ready: {status.get('numberReady', '?')}\n"
-        f"Images: {images}\n"
+        f"Images: {_workload_images(spec)}\n"
         f"Labels: {_labels(obj)}"
     )
 
@@ -129,8 +138,8 @@ def _render_service(obj: dict) -> str:
         for p in spec.get("ports", [])
     )
     return (
-        f"Service {meta['name']} / {meta.get('namespace', '')}\n"
-        f"Type: {spec.get('type', 'ClusterIP')}\n"
+        _header("Service", meta)
+        + f"Type: {spec.get('type', 'ClusterIP')}\n"
         f"Ports: {ports or 'none'}\n"
         f"Selector: {json.dumps(spec.get('selector') or {})}\n"
         f"ClusterIP: {spec.get('clusterIP', '?')}\n"
@@ -152,8 +161,8 @@ def _render_ingress(obj: dict) -> str:
         h for t in spec.get("tls", []) for h in t.get("hosts", [])
     ) or "none"
     return (
-        f"Ingress {meta['name']} / {meta.get('namespace', '')}\n"
-        f"IngressClass: {spec.get('ingressClassName', '?')}\n"
+        _header("Ingress", meta)
+        + f"IngressClass: {spec.get('ingressClassName', '?')}\n"
         f"Hosts: {hosts}\n"
         f"Paths: {paths or 'none'}\n"
         f"TLS: {tls_hosts}\n"
@@ -170,8 +179,8 @@ def _render_httproute(obj: dict) -> str:
     )
     rules_count = len(spec.get("rules", []))
     return (
-        f"HTTPRoute {meta['name']} / {meta.get('namespace', '')}\n"
-        f"Hostnames: {hostnames}\n"
+        _header("HTTPRoute", meta)
+        + f"Hostnames: {hostnames}\n"
         f"Gateway: {parents}\n"
         f"Rules: {rules_count}\n"
         f"Labels: {_labels(obj)}"
@@ -186,8 +195,8 @@ def _render_gateway(obj: dict) -> str:
         for l in spec.get("listeners", [])
     )
     return (
-        f"Gateway {meta['name']} / {meta.get('namespace', '')}\n"
-        f"GatewayClass: {spec.get('gatewayClassName', '?')}\n"
+        _header("Gateway", meta)
+        + f"GatewayClass: {spec.get('gatewayClassName', '?')}\n"
         f"Listeners: {listeners or 'none'}\n"
         f"Labels: {_labels(obj)}"
     )
@@ -205,8 +214,8 @@ def _render_cronjob(obj: dict) -> str:
     )
     images = ", ".join(c.get("image", "?") for c in containers)
     return (
-        f"CronJob {meta['name']} / {meta.get('namespace', '')}\n"
-        f"Schedule: {spec.get('schedule', '?')}\n"
+        _header("CronJob", meta)
+        + f"Schedule: {spec.get('schedule', '?')}\n"
         f"Images: {images}\n"
         f"Suspend: {spec.get('suspend', False)}\n"
         f"Labels: {_labels(obj)}"
@@ -219,8 +228,8 @@ def _render_hpa(obj: dict) -> str:
     status = obj.get("status", {})
     ref = spec.get("scaleTargetRef", {})
     return (
-        f"HorizontalPodAutoscaler {meta['name']} / {meta.get('namespace', '')}\n"
-        f"Target: {ref.get('kind', '?')}/{ref.get('name', '?')}\n"
+        _header("HorizontalPodAutoscaler", meta)
+        + f"Target: {ref.get('kind', '?')}/{ref.get('name', '?')}\n"
         f"Replicas: {status.get('currentReplicas', '?')} current, "
         f"min={spec.get('minReplicas', '?')} max={spec.get('maxReplicas', '?')}\n"
         f"Labels: {_labels(obj)}"
@@ -231,9 +240,6 @@ def _render_node(obj: dict) -> str:
     meta = obj["metadata"]
     status = obj.get("status", {})
     alloc = status.get("allocatable", {})
-    conditions = ", ".join(
-        f"{c['type']}={c['status']}" for c in status.get("conditions", [])
-    )
     roles = ", ".join(
         k.replace("node-role.kubernetes.io/", "")
         for k in (meta.get("labels") or {})
@@ -247,7 +253,7 @@ def _render_node(obj: dict) -> str:
         f"Node {meta['name']}\n"
         f"Roles: {roles}\n"
         f"CPU: {alloc.get('cpu', '?')}, Memory: {alloc.get('memory', '?')}\n"
-        f"Conditions: {conditions or 'none'}\n"
+        f"Conditions: {_format_conditions(status.get('conditions', []))}\n"
         f"Taints: {taints}"
     )
 
@@ -256,14 +262,11 @@ def _render_rabbitmq(obj: dict) -> str:
     meta = obj["metadata"]
     spec = obj.get("spec", {})
     status = obj.get("status", {})
-    conditions = ", ".join(
-        f"{c.get('type')}={c.get('status')}" for c in status.get("conditions", [])
-    )
     return (
-        f"RabbitmqCluster {meta['name']} / {meta.get('namespace', '')}\n"
-        f"Replicas: {spec.get('replicas', '?')}\n"
+        _header("RabbitmqCluster", meta)
+        + f"Replicas: {spec.get('replicas', '?')}\n"
         f"Image: {spec.get('image', 'default')}\n"
-        f"Conditions: {conditions or 'none'}\n"
+        f"Conditions: {_format_conditions(status.get('conditions', []))}\n"
         f"Labels: {_labels(obj)}"
     )
 
