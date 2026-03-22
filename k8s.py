@@ -336,10 +336,20 @@ def _watch_resource(
             kwargs: dict[str, Any] = {"timeout_seconds": 0}
 
             if is_core:
+                # CoreV1Api method names don't always match plural[:-1] — explicit overrides
+                _core_method: dict[str, str] = {
+                    "persistentvolumeclaims": "persistent_volume_claim",
+                    "persistentvolumes": "persistent_volume",
+                    "resourcequotas": "resource_quota",
+                    "serviceaccounts": "service_account",
+                    "configmaps": "config_map",
+                    "endpoints": "endpoints",
+                }
+                method_name = _core_method.get(plural, plural[:-1])
                 if namespaced:
-                    list_fn = getattr(core_api, f"list_{plural[:-1]}_for_all_namespaces")
+                    list_fn = getattr(core_api, f"list_{method_name}_for_all_namespaces")
                 else:
-                    list_fn = getattr(core_api, f"list_{plural[:-1]}")
+                    list_fn = getattr(core_api, f"list_{method_name}")
                 stream = w.stream(list_fn, **kwargs)
             else:
                 if namespaced:
